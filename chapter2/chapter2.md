@@ -197,3 +197,130 @@ std::thread t(process_big_object, std::move(p));
 ```
 在thread构造函数指定`std::move(p)`，让big_object的所有权转移到**新线程的内部存储中**，然后进入`process_big_object`
 
+# 2.3 转移线程的所有权
+存在一种情况，我们想在函数返回时转移线程的所有权，或将线程所有权传入。
+```cpp
+void some_function(); 
+void some_other_function();
+std::thread t1(some_function); // 1
+std::thread t2 = std::move(t1); // 2
+t1 = std::thread(some_other_function); // 3
+std::thread t3; // 4
+t3 = std::move(t2); // 5
+t1 = std::move(t3); // 6
+```
+1. 启动t1线程
+2. 使用`std::move`转移线程所有权，此时`some_function`与t2线程关联
+3. 将`some_other_function`与t1关联
+4. 构造一个线程t3
+5. 将t2的`some_function`转移到t3
+6. 最后再将`some_function`的所有权转移到t1
+
+因为此前t1已经有了一个相关联的线程运行`some_other_function`，此时转移会调用`std::terminate`来终止程序
+
+从函数返回thread
+```cpp
+std:thread f(){
+    void some_function();
+    return std::thread(some_function);
+}
+```
+要转移到函数，可以
+```cpp
+void f(std::thread t); 
+
+void g(){
+    void some_function();
+    f(std::thread(some_function));
+    std::thread t(some_function); 
+    f(std::move(t));
+}
+```
+基于移动的特性，我们可以改造此前的`thread_guard`类，让其实际上获得线程的所有权
+```cpp
+class scoped_thread{
+    std::thread t; 
+public: 
+    explicit scoped_thread(std::thread t_):t(std::move(t_)){
+        if(!t.joinable())
+            throw std::logic_error("No thread");
+    }
+    ~scoped_thread(){
+        t.join(); 
+    }
+    scoped_thread(scoped_thread const&) = delete; 
+    scoped_thread& operator=(scoped_thread const&) = delete; 
+};
+```
+利用容器，生产一批线程
+```cpp
+void do_work(unsigned id); 
+
+void f(){
+    std::vector<std::thread> threads; 
+    for(unsigned i=0; i<20; i++){
+        threads.push_back(std::thread(do_work, i));
+    }
+    std::for_each(threads.begin(), threads.end(), std::mem_fn(&std::threads::join));
+}
+```
+
+# 2.4 在运行时选择线程数量
+`std::thread::hardware_currency()`返回一个对于给定程序执行时能够真正并发运行的线程数量的提示
+
+accumulate的一个并行版本代码
+```cpp
+template<typename Iterator, typename T>
+struct accumulate_block{
+    void operator()(Iterator first, Iterator last, T&result){
+        result = std::accumulate(first, last, result);
+    }
+};
+
+template<typename Iterator, typename T>
+T parallel_accumulate(Iterator first, Iterator last, T init){
+    unsigned long const length = std::distance(first, last);
+    if(!length)
+        return init; 
+
+    unsigned long const min_per_thread = 25; 
+    unsigned long const max_threads = (length + min_per_thread -1) / min_per_thread; 
+
+    unsigned long const hardware_threads = std::thread::hardware_concurrency();
+    unsigned long const num_threads = std::min(hardware_threads!=0 ? hardware_threads: 2, max_threads);
+    unsigned long const block_size = length / num_threads;
+
+    std::vector<T> results(num_threads);
+    std::vector<std::thread> threads(num_threads-1); 
+    Iterator block_start = first; 
+    for(unsigned long i = 0; i <(num_threads-1); ++i){
+        Iterator block_end = block_start; 
+        std::advance(block_end, block_size);
+        threads[i] = std::thread(
+            accumulate_block<Iterator, T>(), 
+            block_start, block_end, std::ref(results[i])
+        );
+        block_start = block_end; 
+    }
+    accumulate_block<Iterator, T>()(block_start, last, results[num_threads-1]);
+    std::for_each(threads.begin(), threads.end(), std::mem_fn(&std::thread::join));
+    return std::accumulate(results.begin(), results.end(), init);
+}
+
+```
+
+# 2.5 标识线程
+线程标识符是`std::thread::id`类型
+我们可以通过调用`get_id()`成员函数获取，若没有相关联的执行线程，则返回一个默认构造对象，表示没有线程
+
+当前线程的标识符可以通过`std::this_thread::get_id()`获得
+
+```cpp
+std::thread::id master_thread; 
+void some_core_part_of_algorithm(){
+    if(std::this_thread::get_id() == master_thread){
+        do_master_thread_work();
+    }
+    do_common_work();
+}
+```
